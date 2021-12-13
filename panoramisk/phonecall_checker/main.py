@@ -10,6 +10,25 @@ AMI_CONNECTION_CONFIG = {
 }
 AMI_CONNECTION_TIMEOUT = 3
 
+ORIGINATE_SETTINGS = {
+    'Action': 'Originate',
+    'Channel': 'Local/1000@origin',
+    'WaitTime': 20,
+    'CallerID': 'username',
+    'Context': 'handler',
+    'Exten': '1000',
+    'Priority': 1,
+    'Async': True
+}
+
+
+class ActionOriginate(panoramisk.actions.Action):
+    def add_message(self, message):
+        self.responses.append(message)
+        if not self.future.done():
+            self.future.set_result(self.responses[0])
+        return True
+
 
 async def work():
     ami_manager = panoramisk.Manager(**AMI_CONNECTION_CONFIG)
@@ -23,11 +42,20 @@ async def work():
     else:
         print("AMI connection has been established!")
 
+    print("Initiating new phonecall...")
+    action_originate = ActionOriginate(ORIGINATE_SETTINGS)
+    initiation_result: panoramisk.Message = await ami_manager.send_action(action_originate)
+    if not initiation_result.success:
+        print("Phonecall initiation failed: %s" % initiation_result.get('Message'))
+        return
+    else:
+        print("New phonecall successfully initiated!")
+
     interval = 5
     while True:
-        print("Worker waits for %s seconds..." % interval)
         await asyncio.sleep(interval)
-        print("Worker doing some work")
+        print("Phonecall state checking is not implemented!")
+        # TODO: Add phonecall state checking
 
 
 def main():
