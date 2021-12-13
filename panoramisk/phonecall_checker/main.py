@@ -10,6 +10,8 @@ AMI_CONNECTION_CONFIG = {
 }
 AMI_CONNECTION_TIMEOUT = 3
 
+AMI_EVENTS = ('OriginateResponse', 'Hangup')
+
 ORIGINATE_SETTINGS = {
     'Action': 'Originate',
     'Channel': 'Local/1000@origin',
@@ -30,6 +32,10 @@ class ActionOriginate(panoramisk.actions.Action):
         return True
 
 
+def handle_ami_event(message: panoramisk.Message):
+    print(message)
+
+
 async def work():
     ami_manager = panoramisk.Manager(**AMI_CONNECTION_CONFIG)
 
@@ -41,6 +47,9 @@ async def work():
         return
     else:
         print("AMI connection has been established!")
+
+    for ami_event in AMI_EVENTS:
+        ami_manager.register_event(ami_event, lambda _, event: handle_ami_event(event))
 
     print("Initiating new phonecall...")
     action_originate = ActionOriginate(ORIGINATE_SETTINGS)
