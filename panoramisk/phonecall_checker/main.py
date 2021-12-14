@@ -1,6 +1,10 @@
 import asyncio
+import logging
 import panoramisk
+import sys
 
+
+log = logging.getLogger()
 
 AMI_CONNECTION_CONFIG = {
     'host': '192.168.50.41',
@@ -33,42 +37,47 @@ class ActionOriginate(panoramisk.actions.Action):
 
 
 def handle_ami_event(message: panoramisk.Message):
-    print(message)
+    log.info(message)
 
 
 async def work():
     ami_manager = panoramisk.Manager(**AMI_CONNECTION_CONFIG)
 
-    print("Attempting AMI connection...")
+    log.info("Attempting AMI connection...")
     await asyncio.wait((ami_manager.connect(), ), return_when=asyncio.FIRST_COMPLETED)
     await asyncio.sleep(AMI_CONNECTION_TIMEOUT)
     if not ami_manager._connected:
-        print("AMI connection attempt failed!")
+        log.error("AMI connection attempt failed!")
         return
     else:
-        print("AMI connection has been established!")
+        log.info("AMI connection has been established!")
 
     for ami_event in AMI_EVENTS:
         ami_manager.register_event(ami_event, lambda _, event: handle_ami_event(event))
 
-    print("Initiating new phonecall...")
+    log.info("Initiating new phonecall...")
     action_originate = ActionOriginate(ORIGINATE_SETTINGS)
     initiation_result: panoramisk.Message = await ami_manager.send_action(action_originate)
     if not initiation_result.success:
-        print("Phonecall initiation failed: %s" % initiation_result.get('Message'))
+        log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
         return
     else:
-        print("New phonecall successfully initiated!")
+        log.info("New phonecall successfully initiated!")
 
     interval = 5
     while True:
         await asyncio.sleep(interval)
-        print("Phonecall state checking is not implemented!")
+        log.warning("Phonecall state checking is not implemented!")
         # TODO: Add phonecall state checking
 
 
 def main():
-    print("Phonecall checker started!")
+    log.setLevel(logging.INFO)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    log.addHandler(handler)
+
+    log.info("Phonecall checker started!")
     loop = asyncio.get_event_loop()
     task = loop.create_task(work())
     try:
@@ -76,7 +85,7 @@ def main():
     except KeyboardInterrupt:
         task.cancel()
     loop.stop()
-    print("Phonecall checker finished!")
+    log.info("Phonecall checker finished!")
 
 
 if __name__ == '__main__':
