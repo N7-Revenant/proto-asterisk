@@ -14,7 +14,10 @@ AMI_CONNECTION_CONFIG = {
 }
 AMI_CONNECTION_TIMEOUT = 3
 
-AMI_EVENTS = ('OriginateResponse', 'Hangup')
+PHONECALL_EVENT_NAME_ORIGINATE_RESPONSE = 'OriginateResponse'
+PHONECALL_EVENT_NAME_HANGUP = 'Hangup'
+
+HANDLED_AMI_EVENTS = (PHONECALL_EVENT_NAME_ORIGINATE_RESPONSE, PHONECALL_EVENT_NAME_HANGUP)
 
 
 class EnhancedManager(panoramisk.Manager):
@@ -55,16 +58,43 @@ class OriginateGenerator:
         return ActionOriginate(originate_params)
 
 
+class PhonecallContext:
+    def __init__(self):
+        self.__phonecall_completed = asyncio.Event()
+
+    def close(self):
+        self.__phonecall_completed.set()
+
+    @property
+    def completion_event(self) -> asyncio.Event:
+        return self.__phonecall_completed
+
+
 class PhonecallController:
     def __init__(self):
         self.__manager = EnhancedManager(**AMI_CONNECTION_CONFIG)
 
-        for ami_event in AMI_EVENTS:
+        for ami_event in HANDLED_AMI_EVENTS:
             self.__manager.register_event(ami_event, lambda _, event: self.handle_ami_event(event))
 
-    @staticmethod
-    def handle_ami_event(message: panoramisk.Message):
-        log.info(message)
+        self.__phonecall_contexts = dict()
+
+    def handle_ami_event(self, message: panoramisk.Message):
+        log.debug(message)
+        event_name = message.get('Event')
+        unique_id = message.get('Uniqueid')
+
+        if event_name == PHONECALL_EVENT_NAME_ORIGINATE_RESPONSE:
+            self.__phonecall_contexts[unique_id] = PhonecallContext()
+            log.info("Phonecall context with UniqueID '%s' has been created on '%s' Event!",
+                     unique_id, PHONECALL_EVENT_NAME_ORIGINATE_RESPONSE)
+
+        elif event_name == PHONECALL_EVENT_NAME_HANGUP:
+            context: PhonecallContext = self.__phonecall_contexts.get(unique_id)
+            if context is not None:
+                context.close()
+                log.info("Phonecall context with UniqueID '%s' has been closed on '%s' Event!",
+                         unique_id, PHONECALL_EVENT_NAME_HANGUP)
 
     async def initiate_ami_connection(self):
         await asyncio.wait((self.__manager.connect(),), return_when=asyncio.FIRST_COMPLETED)
@@ -72,6 +102,18 @@ class PhonecallController:
     @property
     def ami_connected(self):
         return self.__manager.connected
+
+    @property
+    def active_phonecalls(self):
+        result = list()
+        for unique_id in self.__phonecall_contexts:
+            if not self.__phonecall_contexts[unique_id].completion_event.is_set():
+                result.append(unique_id)
+        return result
+
+    async def wait_completion(self, unique_id):
+        if unique_id in self.__phonecall_contexts:
+            await self.__phonecall_contexts[unique_id].completion_event.wait()
 
     async def attempt_phonecall_initiation(self, caller: str = '1000', callee: str = '1000'):
         action_originate = OriginateGenerator.generate_originate_action(callee=callee, caller=caller)
@@ -110,11 +152,21 @@ async def work():
     else:
         log.info("New phonecall successfully initiated!")
 
-    interval = 5
-    while True:
+    interval = 1
+    tracked_phonecall_id = None
+    while tracked_phonecall_id is None:
         await asyncio.sleep(interval)
-        log.warning("Phonecall state checking is not implemented!")
-        # TODO: Add phonecall state checking
+        phonecall_ids = controller.active_phonecalls
+        if len(phonecall_ids) > 0:
+            tracked_phonecall_id = phonecall_ids[0]
+
+    await controller.wait_completion(unique_id=tracked_phonecall_id)
+    await controller.discard_ami_connection()
+
+    # TODO: Add phonecall state checking
+    # while True:
+    #     await asyncio.sleep(interval)
+    #     log.warning("Phonecall state checking is not implemented!")
 
 
 def main():
