@@ -16,16 +16,14 @@ AMI_CONNECTION_TIMEOUT = 3
 
 AMI_EVENTS = ('OriginateResponse', 'Hangup')
 
-ORIGINATE_SETTINGS = {
-    'Action': 'Originate',
-    'Channel': 'Local/1000@origin',
-    'WaitTime': 20,
-    'CallerID': 'username',
-    'Context': 'handler',
-    'Exten': '1000',
-    'Priority': 1,
-    'Async': True
-}
+
+class EnhancedManager(panoramisk.Manager):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+    @property
+    def connected(self):
+        return self._connected
 
 
 class ActionOriginate(panoramisk.actions.Action):
@@ -36,30 +34,78 @@ class ActionOriginate(panoramisk.actions.Action):
         return True
 
 
-def handle_ami_event(message: panoramisk.Message):
-    log.info(message)
+class OriginateGenerator:
+    __BASE_COMMAND = {
+        'Action': 'Originate',
+        'WaitTime': 20,
+        'CallerID': 'username',
+        'Context': 'handler',
+        'Priority': 1,
+        'Async': True
+    }
+
+    @staticmethod
+    def generate_originate_action(callee: str, caller: str) -> ActionOriginate:
+        originate_params = dict()
+        originate_params.update(OriginateGenerator.__BASE_COMMAND)
+        originate_params.update({
+            'Channel': 'Local/%s@origin' % callee,
+            'Exten': '%s' % caller,
+        })
+        return ActionOriginate(originate_params)
+
+
+class PhonecallController:
+    def __init__(self):
+        self.__manager = EnhancedManager(**AMI_CONNECTION_CONFIG)
+
+        for ami_event in AMI_EVENTS:
+            self.__manager.register_event(ami_event, lambda _, event: self.handle_ami_event(event))
+
+    @staticmethod
+    def handle_ami_event(message: panoramisk.Message):
+        log.info(message)
+
+    async def initiate_ami_connection(self):
+        await asyncio.wait((self.__manager.connect(),), return_when=asyncio.FIRST_COMPLETED)
+
+    @property
+    def ami_connected(self):
+        return self.__manager.connected
+
+    async def attempt_phonecall_initiation(self, caller: str = '1000', callee: str = '1000'):
+        action_originate = OriginateGenerator.generate_originate_action(callee=callee, caller=caller)
+        initiation_result: panoramisk.Message = await self.__manager.send_action(action_originate)
+        if not initiation_result.success:
+            log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
+        return initiation_result.success
+
+    @property
+    def ami_manager(self):
+        return self.__manager
+
+    async def discard_ami_connection(self):
+        await self.__manager.close()
 
 
 async def work():
-    ami_manager = panoramisk.Manager(**AMI_CONNECTION_CONFIG)
+    controller = PhonecallController()
 
     log.info("Attempting AMI connection...")
-    await asyncio.wait((ami_manager.connect(), ), return_when=asyncio.FIRST_COMPLETED)
+    await controller.initiate_ami_connection()
     await asyncio.sleep(AMI_CONNECTION_TIMEOUT)
-    if not ami_manager._connected:
+    if not controller.ami_connected:
         log.error("AMI connection attempt failed!")
+        await controller.discard_ami_connection()
         return
     else:
         log.info("AMI connection has been established!")
 
-    for ami_event in AMI_EVENTS:
-        ami_manager.register_event(ami_event, lambda _, event: handle_ami_event(event))
-
     log.info("Initiating new phonecall...")
-    action_originate = ActionOriginate(ORIGINATE_SETTINGS)
-    initiation_result: panoramisk.Message = await ami_manager.send_action(action_originate)
-    if not initiation_result.success:
-        log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
+    phonecall_initiated = await controller.attempt_phonecall_initiation(caller='1000', callee='1000')
+    if not phonecall_initiated:
+        log.error("Unable to initiate phonecall!")
+        await controller.discard_ami_connection()
         return
     else:
         log.info("New phonecall successfully initiated!")
