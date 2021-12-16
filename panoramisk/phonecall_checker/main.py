@@ -12,7 +12,9 @@ AMI_CONNECTION_CONFIG = {
     'username': 'username',
     'secret': 'secret'
 }
-AMI_CONNECTION_TIMEOUT = 3
+
+PHONECALL_CHECK_INTERVAL = 5
+PHONECALL_TRACKING_INTERVAL = 1
 
 PHONECALL_EVENT_NAME_ORIGINATE_RESPONSE = 'OriginateResponse'
 PHONECALL_EVENT_NAME_HANGUP = 'Hangup'
@@ -78,6 +80,22 @@ class PhonecallController:
             self.__manager.register_event(ami_event, lambda _, event: self.handle_ami_event(event))
 
         self.__phonecall_contexts = dict()
+        self.__phonecall_checker_task = None
+
+    async def __check_phonecall_contexts(self):
+        log.info("Phonecall checker task started!")
+        try:
+            while True:
+                await asyncio.sleep(PHONECALL_CHECK_INTERVAL)
+                log.warning("Phonecall state checking is not implemented!")
+
+                # TODO: Add phonecall state checking
+
+        except asyncio.CancelledError:
+            log.info("Phonecall checker task stopped!")
+
+        except Exception as exc:
+            log.error("Phonecall checker task failed with error: %s", exc, exc_info=exc)
 
     def handle_ami_event(self, message: panoramisk.Message):
         log.debug(message)
@@ -98,6 +116,7 @@ class PhonecallController:
 
     async def initiate_ami_connection(self):
         await asyncio.wait((self.__manager.connect(),), return_when=asyncio.FIRST_COMPLETED)
+        self.__phonecall_checker_task = asyncio.get_running_loop().create_task(self.__check_phonecall_contexts())
 
     @property
     def ami_connected(self):
@@ -116,57 +135,60 @@ class PhonecallController:
             await self.__phonecall_contexts[unique_id].completion_event.wait()
 
     async def attempt_phonecall_initiation(self, caller: str = '1000', callee: str = '1000'):
-        action_originate = OriginateGenerator.generate_originate_action(callee=callee, caller=caller)
-        initiation_result: panoramisk.Message = await self.__manager.send_action(action_originate)
-        if not initiation_result.success:
-            log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
-        return initiation_result.success
+        if self.__manager.connected:
+            action_originate = OriginateGenerator.generate_originate_action(callee=callee, caller=caller)
+            initiation_result: panoramisk.Message = await self.__manager.send_action(action_originate)
+            if not initiation_result.success:
+                log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
+            return initiation_result.success
 
-    @property
-    def ami_manager(self):
-        return self.__manager
+        else:
+            log.error("Phonecall initiation failed: AMI connection is missing!")
+            return False
 
-    async def discard_ami_connection(self):
-        await self.__manager.close()
+    def discard_ami_connection(self):
+        if isinstance(self.__phonecall_checker_task, asyncio.Task):
+            self.__phonecall_checker_task.cancel()
+        self.__manager.close()
+
+
+async def wait_phonecalls_completion(controller: PhonecallController, count: int):
+    tracked_phonecalls = set()
+    loop = asyncio.get_running_loop()
+
+    while len(tracked_phonecalls) < count:
+        await asyncio.sleep(PHONECALL_CHECK_INTERVAL)
+        phonecall_ids = controller.active_phonecalls
+        if len(phonecall_ids) > 0:
+            tracked_phonecalls.update(phonecall_ids)
+    else:
+        log.info("Waiting for phonecalls %s to finish...", tracked_phonecalls)
+
+    tasks = list()
+    for uid in tracked_phonecalls:
+        task = loop.create_task(controller.wait_completion(unique_id=uid))
+        tasks.append(task)
+
+    await asyncio.wait(tasks)
+    log.info("All tracked phonecalls %s are finished!", tracked_phonecalls)
 
 
 async def work():
     controller = PhonecallController()
 
-    log.info("Attempting AMI connection...")
+    log.info("Initiating AMI connection...")
     await controller.initiate_ami_connection()
-    await asyncio.sleep(AMI_CONNECTION_TIMEOUT)
-    if not controller.ami_connected:
-        log.error("AMI connection attempt failed!")
-        await controller.discard_ami_connection()
-        return
-    else:
-        log.info("AMI connection has been established!")
 
     log.info("Initiating new phonecall...")
     phonecall_initiated = await controller.attempt_phonecall_initiation(caller='1000', callee='1000')
     if not phonecall_initiated:
         log.error("Unable to initiate phonecall!")
-        await controller.discard_ami_connection()
-        return
+
     else:
         log.info("New phonecall successfully initiated!")
+        await wait_phonecalls_completion(controller=controller, count=1)
 
-    interval = 1
-    tracked_phonecall_id = None
-    while tracked_phonecall_id is None:
-        await asyncio.sleep(interval)
-        phonecall_ids = controller.active_phonecalls
-        if len(phonecall_ids) > 0:
-            tracked_phonecall_id = phonecall_ids[0]
-
-    await controller.wait_completion(unique_id=tracked_phonecall_id)
-    await controller.discard_ami_connection()
-
-    # TODO: Add phonecall state checking
-    # while True:
-    #     await asyncio.sleep(interval)
-    #     log.warning("Phonecall state checking is not implemented!")
+    controller.discard_ami_connection()
 
 
 def main():
