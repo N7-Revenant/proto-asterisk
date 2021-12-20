@@ -3,18 +3,20 @@ import logging
 import panoramisk
 import sys
 import time
+import uuid
 
 
 log = logging.getLogger()
 
-INVALID_PARAM = '000'
-
-CALLER = '1000'
-CALLEES = [
-    '000',  # Error in phonecall
-    '1000',  # Rejected phonecall
-    '3000',  # Unanswered phonecall
-    '4000'  # Answered phonecall
+PHONECALL_INITIATION_TIMEOUT_MS = 3000
+PHONECALL_PARTICIPANTS = [
+    ('000', '000'),     # Incorrect params
+    ('1000', '000'),    # Error in phonecall
+    ('1000', '1000'),   # Rejected phonecall
+    ('1000', '3000'),   # Unanswered phonecall
+    ('1000', '4000'),   # Answered phonecall
+    ('1000', '4001'),   # Answered phonecall
+    ('1000', '4002')    # Answered phonecall
 ]
 
 AMI_CONNECTION_CONFIG = {
@@ -43,18 +45,21 @@ class EnhancedManager(panoramisk.Manager):
         return self._connected
 
 
-class EnhancedAction(panoramisk.actions.Action):
+class EnhancedAction(panoramisk.manager.actions.Action):
     def add_message(self, message):
         self.responses.append(message)
         if not self.future.done():
             self.future.set_result(self.responses[0])
         return True
 
+    def __delitem__(self, key):
+        raise NotImplementedError()
+
 
 class ActionGenerator:
     __BASE_ORIGINATE_PARAMS = {
         'Action': 'Originate',
-        'Timeout': 5000,
+        'Timeout': PHONECALL_INITIATION_TIMEOUT_MS,
         'CallerID': 'username',
         'Context': 'handler',
         'Priority': 1,
@@ -70,6 +75,7 @@ class ActionGenerator:
         originate_params = dict()
         originate_params.update(ActionGenerator.__BASE_ORIGINATE_PARAMS)
         originate_params.update({
+            'ActionID': '%s' % uuid.uuid4(),
             'Channel': 'Local/%s@origin' % callee,
             'Exten': '%s' % caller,
         })
@@ -133,6 +139,7 @@ class PhonecallController:
 
         self.__manager.register_event('*', lambda _, event: self.handle_ami_event(event))
 
+        self.__phonecall_initiations = set()
         self.__phonecall_contexts = dict()
         self.__phonecall_checker_task = None
 
@@ -167,6 +174,9 @@ class PhonecallController:
         channel_name = message.get('Channel')
 
         if event_name == AMI_EVENT_NAME_ORIGINATE_RESPONSE:
+            action_id = message.get('ActionID')
+            self.__phonecall_initiations.discard(action_id)
+
             if unique_id == '<null>':
                 log.warning("Phonecall context is not created on '%s' Event - UniqueID is empty: %s!",
                             event_name, message)
@@ -187,7 +197,7 @@ class PhonecallController:
             context: PhonecallContext = self.__phonecall_contexts.get(unique_id)
             if context is not None:
                 context.uphold()
-                log.info("Phonecall context with UniqueID '%s' uphold on '%s' Event!",
+                log.info("Phonecall context with UniqueID '%s' upheld on '%s' Event!",
                          unique_id, event_name)
 
     async def initiate_ami_connection(self):
@@ -216,11 +226,17 @@ class PhonecallController:
             initiation_result: panoramisk.Message = await self.__manager.send_action(action_originate)
             if not initiation_result.success:
                 log.error("Phonecall initiation failed: %s", initiation_result.get('Message'))
+            else:
+                self.__phonecall_initiations.add(action_originate.id)
             return initiation_result.success
 
         else:
             log.error("Phonecall initiation failed: AMI connection is missing!")
             return False
+
+    @property
+    def initiating_phonecalls(self):
+        return tuple(self.__phonecall_initiations)
 
     def discard_ami_connection(self):
         if isinstance(self.__phonecall_checker_task, asyncio.Task):
@@ -228,17 +244,22 @@ class PhonecallController:
         self.__manager.close()
 
 
-async def wait_phonecalls_completion(controller: PhonecallController, count: int):
+async def wait_phonecalls_completion(controller: PhonecallController):
     tracked_phonecalls = set()
     loop = asyncio.get_running_loop()
 
-    while len(tracked_phonecalls) < count:
+    while len(controller.initiating_phonecalls) > 0:
+        log.info("Waiting for '%s' phonecall(s) %s to be initiated...",
+                 len(controller.initiating_phonecalls), controller.initiating_phonecalls)
         await asyncio.sleep(INTERVAL_PHONECALL_CHECK)
+
+    else:
         phonecall_ids = controller.active_phonecalls
         if len(phonecall_ids) > 0:
             tracked_phonecalls.update(phonecall_ids)
-    else:
-        log.info("Waiting for phonecalls %s to finish...", tracked_phonecalls)
+
+    log.info("Tracking phonecall context(s): %s", tracked_phonecalls)
+    log.info("Waiting for '%s' phonecall(s) to finish...", len(tracked_phonecalls))
 
     tasks = list()
     for uid in tracked_phonecalls:
@@ -255,14 +276,10 @@ async def work():
     log.info("Initiating AMI connection...")
     await controller.initiate_ami_connection()
 
-    # Attempting phonecall initiation with invalid params
-    await controller.attempt_phonecall_initiation(caller=INVALID_PARAM, callee=INVALID_PARAM)
-
-    # Attempting phonecall initiation with valid params
     log.info("Initiating new phonecall...")
     some_phonecall_initiated = False
-    for callee in CALLEES:
-        initiation_outcome = await controller.attempt_phonecall_initiation(caller=CALLER, callee=callee)
+    for caller, callee in PHONECALL_PARTICIPANTS:
+        initiation_outcome = await controller.attempt_phonecall_initiation(caller=caller, callee=callee)
         if not some_phonecall_initiated:
             some_phonecall_initiated = initiation_outcome
 
@@ -271,7 +288,7 @@ async def work():
 
     else:
         log.info("New phonecall successfully initiated!")
-        await wait_phonecalls_completion(controller=controller, count=1)
+        await wait_phonecalls_completion(controller=controller)
 
     controller.discard_ami_connection()
 
