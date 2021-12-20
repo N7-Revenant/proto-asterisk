@@ -2,32 +2,36 @@ import asyncio
 import logging
 import panoramisk
 import sys
+import time
 
 
 log = logging.getLogger()
+
+INVALID_PARAM = '000'
 
 CALLER = '1000'
 CALLEES = [
     '000',  # Error in phonecall
     '1000',  # Rejected phonecall
+    '3000',  # Unanswered phonecall
     '4000'  # Answered phonecall
 ]
 
 AMI_CONNECTION_CONFIG = {
     'host': '192.168.50.41',
     'port': 5038,
-    'username': 'username',
+    # 'username': 'username',  # AMI User with correct events
+    'username': 'hangupless',  # AMI User without "Hangup" event
     'secret': 'secret'
 }
 
-INTERVAL_PHONECALL_CHECK = 3
-INTERVAL_PHONECALL_TRACKING = 1
+INTERVAL_PHONECALL_CHECK = 1.
+INTERVAL_PHONECALL_CONTEXT_UPHOLD = 3.
+INTERVAL_PHONECALL_STATUS_REQUEST = 5.
 
 AMI_EVENT_NAME_ORIGINATE_RESPONSE = 'OriginateResponse'
 AMI_EVENT_NAME_STATUS = 'Status'
 AMI_EVENT_NAME_HANGUP = 'Hangup'
-
-HANDLED_AMI_EVENTS = (AMI_EVENT_NAME_ORIGINATE_RESPONSE, AMI_EVENT_NAME_STATUS, AMI_EVENT_NAME_HANGUP)
 
 
 class EnhancedManager(panoramisk.Manager):
@@ -50,7 +54,7 @@ class EnhancedAction(panoramisk.actions.Action):
 class ActionGenerator:
     __BASE_ORIGINATE_PARAMS = {
         'Action': 'Originate',
-        'WaitTime': 10,
+        'Timeout': 5000,
         'CallerID': 'username',
         'Context': 'handler',
         'Priority': 1,
@@ -88,6 +92,21 @@ class PhonecallContext:
 
         self.__phonecall_completed = asyncio.Event()
 
+        self.__ts_last_activity = time.time()
+        self.__ts_last_status_request = 0
+
+    def uphold(self):
+        self.__ts_last_activity = time.time()
+
+    def check_activity_required(self, max_idle_time: float) -> bool:
+        return time.time() - self.__ts_last_activity > max_idle_time
+
+    def check_status_request_allowed(self, request_interval: float) -> bool:
+        return time.time() - self.__ts_last_status_request > request_interval
+
+    def status_requested(self):
+        self.__ts_last_status_request = time.time()
+
     def close(self):
         self.__phonecall_completed.set()
 
@@ -103,13 +122,16 @@ class PhonecallContext:
     def completion_event(self) -> asyncio.Event:
         return self.__phonecall_completed
 
+    @property
+    def completed(self) -> bool:
+        return self.__phonecall_completed.is_set()
+
 
 class PhonecallController:
     def __init__(self):
         self.__manager = EnhancedManager(**AMI_CONNECTION_CONFIG)
 
-        for ami_event in HANDLED_AMI_EVENTS:
-            self.__manager.register_event(ami_event, lambda _, event: self.handle_ami_event(event))
+        self.__manager.register_event('*', lambda _, event: self.handle_ami_event(event))
 
         self.__phonecall_contexts = dict()
         self.__phonecall_checker_task = None
@@ -120,10 +142,13 @@ class PhonecallController:
             while True:
                 await asyncio.sleep(INTERVAL_PHONECALL_CHECK)
                 for context in self.__phonecall_contexts.values():  # type: PhonecallContext
-                    if not context.completion_event.is_set():
+                    if (not context.completed
+                            and context.check_activity_required(INTERVAL_PHONECALL_CONTEXT_UPHOLD)
+                            and context.check_status_request_allowed(INTERVAL_PHONECALL_STATUS_REQUEST)):
                         result: panoramisk.Message = await self.__manager.send_action(
                             ActionGenerator.generate_status_action(channel=context.channel_name))
                         log.debug("Channel check result: %s", result)
+                        context.status_requested()
                         if not result.success:
                             context.close()
                             log.info("Phonecall context with UniqueID '%s' has been closed on Channel check fail!",
@@ -151,18 +176,18 @@ class PhonecallController:
                 log.info("Phonecall context with UniqueID '%s' has been created on '%s' Event!",
                          unique_id, event_name)
 
-        elif event_name == AMI_EVENT_NAME_STATUS:
-            context: PhonecallContext = self.__phonecall_contexts.get(unique_id)
-            if context is not None:
-                log.info("Phonecall context with UniqueID '%s' maintained on '%s' Event!",
-                         unique_id, event_name)
-                # TODO: Add some extra work with phonecall context
-
         elif event_name == AMI_EVENT_NAME_HANGUP:
             context: PhonecallContext = self.__phonecall_contexts.get(unique_id)
             if context is not None:
                 context.close()
                 log.info("Phonecall context with UniqueID '%s' has been closed on '%s' Event!",
+                         unique_id, event_name)
+
+        else:
+            context: PhonecallContext = self.__phonecall_contexts.get(unique_id)
+            if context is not None:
+                context.uphold()
+                log.info("Phonecall context with UniqueID '%s' uphold on '%s' Event!",
                          unique_id, event_name)
 
     async def initiate_ami_connection(self):
@@ -230,6 +255,10 @@ async def work():
     log.info("Initiating AMI connection...")
     await controller.initiate_ami_connection()
 
+    # Attempting phonecall initiation with invalid params
+    await controller.attempt_phonecall_initiation(caller=INVALID_PARAM, callee=INVALID_PARAM)
+
+    # Attempting phonecall initiation with valid params
     log.info("Initiating new phonecall...")
     some_phonecall_initiated = False
     for callee in CALLEES:
